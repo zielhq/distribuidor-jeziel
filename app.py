@@ -1,38 +1,49 @@
 import streamlit as st
 import pandas as pd
 import io
-from collections import defaultdict, Counter
+import random
 
 st.set_page_config(page_title="Distribuidor Jeziel", layout="wide")
 st.title("Distribuidor Jeziel 🚗")
-st.markdown("Faça upload de um arquivo .xlsx/.csv com colunas CHASSI, RUA e VAGA. O app fará a distribuição respeitando faixas, CILs e modelos.")
+st.markdown(
+    "Faça upload de um arquivo .xlsx/.csv com colunas CHASSI, RUA e VAGA. "
+    "O app fará a distribuição respeitando faixas, CILs e modelos."
+)
 
-# --- helpers
+# --- Helpers ---
+
 def faixa_rua(rua_raw):
+    """
+    Converte:
+    - '411B' -> 400 (faixa 400-499)
+    - 'CIL1' -> 100, 'CIL2' -> 200 etc.
+    Retorna a faixa base como múltiplo de 100 ou -1 se inválido.
+    """
     if pd.isna(rua_raw):
         return -1
-    r = str(rua_raw).strip()
-    r_lower = r.lower()
-    if r_lower.startswith("cil"):
-        digits = ''.join([c for c in r_lower if c.isdigit()])
+    r = str(rua_raw).strip().lower()
+    if r.startswith("cil"):
+        digits = ''.join([c for c in r if c.isdigit()])
         try:
-            n = int(digits)
-            return n * 100
+            return int(digits) * 100
         except:
             return -1
+    # Extrai número principal, ignora letras
     digits = ''.join([c for c in r if c.isdigit()])
-    if digits == "":
+    if not digits:
         return -1
     try:
-        return int(digits)
+        num = int(digits)
+        faixa = (num // 100) * 100  # Ex: 411 -> 400
+        return faixa
     except:
         return -1
 
 def modelo_por_chassi(chassi):
     if pd.isna(chassi):
         return "unknown"
-    c = str(chassi).strip()
-    prefix = c[:6].upper() if len(c) >= 6 else c
+    c = str(chassi).strip().upper()
+    prefix = c[:6] if len(c) >= 6 else c
     if prefix == "93YRBB":
         return "kwid"
     if prefix == "93YHJD":
@@ -41,28 +52,49 @@ def modelo_por_chassi(chassi):
         return "oroch"
     return "outro"
 
-def distribuir_equilibrado(indices, num_tecnicos, start_order=None):
-    mapping = {}
-    n = len(indices)
-    base = n // num_tecnicos
-    sobra = n % num_tecnicos
-    ptr = 0
-    for t in range(num_tecnicos):
-        take = base + (1 if t < sobra else 0)
-        for i in range(take):
-            if ptr < n:
-                mapping[indices[ptr]] = t
-                ptr += 1
-    return mapping
+def distribuir_entre_tecnicos(indices, num_tecnicos):
+    """
+    Distribui indices igualmente entre técnicos.
+    Se sobrarem veículos, distribui de forma aleatória para alguns técnicos (1 a mais no máximo).
+    Retorna dicionário idx -> técnico (int)
+    """
+    assigned = {}
+    total = len(indices)
+    base = total // num_tecnicos
+    sobra = total % num_tecnicos
 
-# --- UI
-uploaded = st.file_uploader("Selecione .xlsx ou .csv (com colunas CHASSI, RUA, VAGA)", type=["xlsx", "xls", "csv"])
-num_tecnicos = st.number_input("Quantidade de técnicos", min_value=1, max_value=20, value=3, step=1)
-nomes_text = st.text_input("Nomes dos técnicos (separados por vírgula) — ou deixe em branco para usar Técnico 1, Técnico 2...", "")
+    # Quantidade por técnico inicialmente
+    cargas = [base] * num_tecnicos
+
+    # Distribui a sobra aleatoriamente para técnicos diferentes
+    if sobra > 0:
+        extras_indices = random.sample(range(num_tecnicos), sobra)
+        for i in extras_indices:
+            cargas[i] += 1
+
+    ptr = 0
+    for tech_idx, qtd in enumerate(cargas):
+        for _ in range(qtd):
+            assigned[indices[ptr]] = tech_idx
+            ptr += 1
+
+    return assigned
+
+# --- UI ---
+
+uploaded = st.file_uploader(
+    "Selecione .xlsx ou .csv (com colunas CHASSI, RUA, VAGA)", type=["xlsx", "xls", "csv"]
+)
+num_tecnicos = st.number_input(
+    "Quantidade de técnicos", min_value=1, max_value=20, value=3, step=1
+)
+nomes_text = st.text_input(
+    "Nomes dos técnicos (separados por vírgula) — ou deixe em branco para usar Técnico 1, Técnico 2...", ""
+)
 if nomes_text.strip():
     nomes_tecnicos = [n.strip() for n in nomes_text.split(",") if n.strip()]
     while len(nomes_tecnicos) < num_tecnicos:
-        nomes_tecnicos.append(f"Técnico {len(nomes_tecnicos)+1}")
+        nomes_tecnicos.append(f"Técnico {len(nomes_tecnicos) + 1}")
 else:
     nomes_tecnicos = [f"Técnico {i+1}" for i in range(num_tecnicos)]
 
@@ -86,99 +118,92 @@ if uploaded and process_btn:
         st.error("Arquivo precisa conter as colunas: CHASSI, RUA, VAGA")
         st.stop()
 
+    # Mantém a ordem original, adiciona coluna para preservar índice original
     df = df.reset_index().rename(columns={"index": "_orig_index"})
-    df["_FAIXA_BASE"] = df["RUA"].apply(faixa_rua)
 
-    def faixa_key_from_base(base):
-        if base < 0:
-            return -1
-        return (base // 100) * 100
-
-    df["_FAIXA_KEY"] = df["_FAIXA_BASE"].apply(faixa_key_from_base)
+    # Aplica faixa para cada rua
+    df["_FAIXA"] = df["RUA"].apply(faixa_rua)
     df["_MODELO"] = df["CHASSI"].apply(modelo_por_chassi)
 
-    num_t = int(num_tecnicos)
-    assigned = {i: None for i in df.index}
-    carga = [0]*num_t
+    assigned = {}
+    carga = [0] * num_tecnicos
 
-    non_kwid_models = df[df["_MODELO"] != "kwid"]["_MODELO"].unique().tolist()
+    # 1) Distribuir modelos não-kwid que aparecem mais de 4 vezes (por modelo):
+    modelos_especiais = df[df["_MODELO"] != "kwid"]["_MODELO"].unique()
+    for modelo in modelos_especiais:
+        idxs_modelo = df[df["_MODELO"] == modelo].index.tolist()
+        if len(idxs_modelo) > 4:
+            # Distribuir 1 por técnico igualitariamente
+            dist = distribuir_entre_tecnicos(idxs_modelo, num_tecnicos)
+            # Atualiza assigned e carga
+            for idx, tech in dist.items():
+                assigned[idx] = tech
+                carga[tech] += 1
 
-    for model in non_kwid_models:
-        idxs = df[(df["_MODELO"] == model)].index.tolist()
-        if not idxs:
+    # 2) Agora distribui o restante dos veículos, agrupando por faixa
+    # Veículos já atribuídos não entram
+    faixas = df["_FAIXA"].unique()
+    # Ordena faixas para preservar ordem
+    faixas = [f for f in df["_FAIXA"] if f in faixas]
+    faixas = list(dict.fromkeys(faixas))  # remove duplicados mantendo ordem
+
+    for faixa in faixas:
+        idxs_faixa = df[(df["_FAIXA"] == faixa)].index.tolist()
+        # Filtra os não atribuídos
+        idxs_nao_atribuido = [i for i in idxs_faixa if i not in assigned]
+
+        if not idxs_nao_atribuido:
             continue
-        if len(idxs) >= num_t:
-            mapping = distribuir_equilibrado(idxs, num_t)
-            for idx, tech in mapping.items():
-                assigned[idx] = tech
-                carga[tech] += 1
-        else:
-            order = sorted(range(num_t), key=lambda x: carga[x])
-            for i, idx in enumerate(idxs):
-                tech = order[i % num_t]
-                assigned[idx] = tech
-                carga[tech] += 1
 
-    faixa_keys_in_order = []
-    for _, row in df.iterrows():
-        fk = row["_FAIXA_KEY"]
-        if fk not in faixa_keys_in_order:
-            faixa_keys_in_order.append(fk)
+        dist = distribuir_entre_tecnicos(idxs_nao_atribuido, num_tecnicos)
+        for idx, tech in dist.items():
+            assigned[idx] = tech
+            carga[tech] += 1
 
-    # --- AQUI A MODIFICAÇÃO PRINCIPAL: distribuir faixas inteiras para técnicos
-    for fk in faixa_keys_in_order:
-        group_idxs = df[(df["_FAIXA_KEY"] == fk)].index.tolist()
-        if all(assigned[i] is not None for i in group_idxs):
-            continue
-        tech = carga.index(min(carga))
-        for idx in group_idxs:
-            if assigned[idx] is None:
-                assigned[idx] = tech
-                carga[tech] += 1
-
-    def current_diff():
+    # 3) Para garantir max-min carga <= 1, faz balanceamento simples trocando cargas
+    def diff_carga():
         return max(carga) - min(carga)
 
-    attempts = 0
-    max_attempts = 1000
-    while current_diff() > 1 and attempts < max_attempts:
-        attempts += 1
-        max_tech = max(range(num_t), key=lambda x: carga[x])
-        min_tech = min(range(num_t), key=lambda x: carga[x])
-        moved = False
-        for fk in faixa_keys_in_order:
-            idxs_in_fk = [i for i in df[(df["_FAIXA_KEY"] == fk)].index.tolist() if assigned[i] == max_tech]
-            if len(idxs_in_fk) > 0:
-                cand = idxs_in_fk[-1]
-                assigned[cand] = min_tech
-                carga[max_tech] -= 1
-                carga[min_tech] += 1
-                moved = True
-                break
-        if not moved:
-            cand_list = [i for i,v in assigned.items() if v == max_tech]
-            if cand_list:
-                cand = cand_list[-1]
-                assigned[cand] = min_tech
-                carga[max_tech] -= 1
-                carga[min_tech] += 1
-            else:
-                break
+    tentativas = 0
+    max_tentativas = 1000
+    while diff_carga() > 1 and tentativas < max_tentativas:
+        tentativas += 1
+        tech_max = carga.index(max(carga))
+        tech_min = carga.index(min(carga))
 
-    df["TECNICO"] = df.index.map(lambda i: nomes_tecnicos[assigned[i]] if assigned[i] is not None else "")
-    df_sorted_for_output = df.sort_values("_orig_index").drop(columns=["_orig_index","_FAIXA_BASE","_FAIXA_KEY","_MODELO"])
+        # Tenta encontrar um idx para trocar
+        idxs_do_max = [i for i, t in assigned.items() if t == tech_max]
+        if not idxs_do_max:
+            break
+        idx_troca = idxs_do_max[-1]
+
+        assigned[idx_troca] = tech_min
+        carga[tech_max] -= 1
+        carga[tech_min] += 1
+
+    # 4) Aplica nomes dos técnicos
+    df["TECNICO"] = df.index.map(lambda i: nomes_tecnicos[assigned[i]] if i in assigned else "")
+
+    # Mantém ordem original para salvar
+    df_saida = df.sort_values("_orig_index").drop(columns=["_orig_index", "_FAIXA", "_MODELO"])
 
     st.success("Distribuição concluída.")
     st.write("Carga por técnico:")
-    carga_df = pd.DataFrame({"Técnico": nomes_tecnicos, "Qtd": carga})
-    st.table(carga_df)
+    st.table(pd.DataFrame({"Técnico": nomes_tecnicos, "Qtd": carga}))
 
     st.write("Amostra da planilha resultante:")
-    st.dataframe(df_sorted_for_output.head(200))
+    st.dataframe(df_saida.head(200))
 
+    # Download da planilha
     output_buffer = io.BytesIO()
     with pd.ExcelWriter(output_buffer, engine="openpyxl") as writer:
-        df_sorted_for_output.to_excel(writer, index=False)
+        df_saida.to_excel(writer, index=False)
     output_buffer.seek(0)
 
-    st.download_button("📥 Baixar planilha (Excel)", data=output_buffer, file_name="distribuicao_tecnicos.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.download_button(
+        "📥 Baixar planilha (Excel)",
+        data=output_buffer,
+        file_name="distribuicao_tecnicos.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
