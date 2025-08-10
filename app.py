@@ -1,96 +1,182 @@
 import streamlit as st
 import pandas as pd
+import io
 import random
-import re
 
-st.title("Distribuição de Veículos por Técnicos")
+st.set_page_config(page_title="Distribuidor Jeziel", layout="wide")
+st.title("Distribuidor Jeziel 🚗")
+st.markdown("Faça upload de um arquivo .xlsx/.csv com colunas CHASSI, RUA e VAGA. O app fará a distribuição por faixas de rua (mantendo ordem original).")
 
-# Função para identificar a faixa da rua
-def get_faixa_key(rua):
-    if pd.isna(rua):
+# -----------------------
+# Helpers
+# -----------------------
+def faixa_rua(rua_raw):
+    if pd.isna(rua_raw):
         return None
-    rua_str = str(rua).strip().upper()
+    r = str(rua_raw).strip()
+    rl = r.lower()
 
-    # Tratar Cil1, Cil2, ...
-    m = re.match(r"CIL(\d+)", rua_str)
-    if m:
-        base = int(m.group(1)) * 100
-        return f"{base}-{base+99}"
+    if rl.startswith("cil"):
+        digits = ''.join(c for c in rl if c.isdigit())
+        try:
+            return int(digits) * 100
+        except:
+            return None
 
-    # Extrair número inicial
-    m = re.match(r"(\d+)", rua_str)
-    if m:
-        numero = int(m.group(1))
-        base = (numero // 100) * 100
-        return f"{base}-{base+99}"
+    digits = ''.join(c for c in r if c.isdigit())
+    if digits == "":
+        return None
+    try:
+        num = int(digits)
+        return (num // 100) * 100
+    except:
+        return None
 
-    return None
+def distribuir_faixa_contigua(indices, num_tecnicos):
+    mapping = {}
+    total = len(indices)
+    if total == 0:
+        return mapping
 
-# Entrada de técnicos
-tecnicos_input = st.text_input("Digite os nomes dos técnicos separados por vírgula:")
-tecnicos = [t.strip() for t in tecnicos_input.split(",") if t.strip()]
+    base = total // num_tecnicos
+    sobra = total % num_tecnicos
 
-arquivo = st.file_uploader("Envie o arquivo Excel", type=["xlsx"])
+    chunk_sizes = [base] * num_tecnicos
+    if sobra > 0:
+        pos_extra = random.sample(range(num_tecnicos), sobra)
+        for p in pos_extra:
+            chunk_sizes[p] += 1
 
-if arquivo and tecnicos:
-    df = pd.read_excel(arquivo)
+    tech_order = random.sample(list(range(num_tecnicos)), k=num_tecnicos)
 
-    # Detectar coluna da RUA
-    col_rua = None
-    for col in df.columns:
-        if "RUA" in str(col).upper():
-            col_rua = col
+    ptr = 0
+    for i, size in enumerate(chunk_sizes):
+        tech = tech_order[i]
+        for _ in range(size):
+            if ptr >= total:
+                break
+            idx = indices[ptr]
+            mapping[idx] = tech
+            ptr += 1
+
+    return mapping
+
+def balancear_globais(assigned, num_tecnicos):
+    """Ajusta assigned para que diferença máxima entre técnicos seja 1."""
+    # Conta veículos por técnico
+    carga = {t: 0 for t in range(num_tecnicos)}
+    for t in assigned.values():
+        carga[t] += 1
+
+    max_carga = max(carga.values())
+    min_carga = min(carga.values())
+
+    # Enquanto diferença > 1, mover 1 veículo do mais carregado para o menos carregado
+    while max_carga - min_carga > 1:
+        tech_max = max(carga, key=carga.get)
+        tech_min = min(carga, key=carga.get)
+
+        # Escolher um índice do tech_max para mover
+        idx_para_mover = None
+        for idx, t in assigned.items():
+            if t == tech_max:
+                idx_para_mover = idx
+                break
+
+        if idx_para_mover is None:
             break
-    if col_rua is None:
-        st.error("Não encontrei coluna 'RUA' no arquivo.")
+
+        assigned[idx_para_mover] = tech_min
+        carga[tech_max] -= 1
+        carga[tech_min] += 1
+
+        max_carga = max(carga.values())
+        min_carga = min(carga.values())
+
+    return assigned
+
+# -----------------------
+# UI
+# -----------------------
+uploaded = st.file_uploader("Selecione .xlsx ou .csv (com colunas CHASSI, RUA, VAGA)", type=["xlsx", "xls", "csv"])
+num_tecnicos = st.number_input("Quantidade de técnicos", min_value=1, max_value=20, value=3, step=1)
+nomes_text = st.text_input("Nomes dos técnicos (separados por vírgula) — ou deixe em branco para usar Técnico 1, Técnico 2...", "")
+
+if nomes_text.strip():
+    nomes_tecnicos = [n.strip() for n in nomes_text.split(",") if n.strip()]
+    while len(nomes_tecnicos) < num_tecnicos:
+        nomes_tecnicos.append(f"Técnico {len(nomes_tecnicos)+1}")
+else:
+    nomes_tecnicos = [f"Técnico {i+1}" for i in range(num_tecnicos)]
+
+st.write("Técnicos:", ", ".join(nomes_tecnicos))
+
+process_btn = st.button("Distribuir e baixar planilha")
+
+if uploaded and process_btn:
+    try:
+        if uploaded.name.lower().endswith((".xlsx", ".xls")):
+            df = pd.read_excel(uploaded)
+        else:
+            df = pd.read_csv(uploaded)
+    except Exception as e:
+        st.error(f"Erro ao ler arquivo: {e}")
         st.stop()
 
-    # Adicionar coluna de faixa
-    df["_FAIXA_KEY"] = df[col_rua].apply(get_faixa_key)
+    df.columns = [c.strip().upper() for c in df.columns]
 
-    # Filtrar apenas faixas válidas (ex.: '300-399', '400-499', etc.)
-    df_valid = df[df["_FAIXA_KEY"].notna()].copy()
+    if not all(col in df.columns for col in ["CHASSI", "RUA", "VAGA"]):
+        st.error("Arquivo precisa conter as colunas: CHASSI, RUA, VAGA")
+        st.stop()
 
-    # Criar estrutura para manter ordem original
-    veiculos = list(df_valid.index)
+    df = df.reset_index(drop=True)
+    df["_orig_index"] = list(range(len(df)))
 
-    # Agrupar por faixa mantendo ordem original
-    faixas_ordenadas = []
-    vistos = set()
-    for idx in veiculos:
-        fk = df_valid.at[idx, "_FAIXA_KEY"]
-        if fk not in vistos:
-            vistos.add(fk)
-            faixas_ordenadas.append(fk)
+    df["_FAIXA_KEY"] = df["RUA"].apply(faixa_rua)
+    df_validos = df[df["_FAIXA_KEY"].notna()].copy()
 
-    # Inicializar distribuição
-    assigned = {idx: None for idx in df_valid.index}
-    carga = {tec: 0 for tec in tecnicos}
+    faixas_em_ordem = []
+    for _, row in df_validos.iterrows():
+        fk = row["_FAIXA_KEY"]
+        if fk not in faixas_em_ordem:
+            faixas_em_ordem.append(fk)
 
-    # Embaralhar ordem inicial dos técnicos para não começar sempre pelo mesmo
-    ordem_tecnicos = tecnicos[:]
-    random.shuffle(ordem_tecnicos)
+    assigned = {}
+    for fk in faixas_em_ordem:
+        subset = df_validos[df_validos["_FAIXA_KEY"] == fk]
+        subset = subset.sort_values("_orig_index")
+        idxs = subset.index.tolist()
+        mapping = distribuir_faixa_contigua(idxs, num_tecnicos)
+        assigned.update(mapping)
 
-    # Distribuir por faixa mantendo equilíbrio global
-    for fk in faixas_ordenadas:
-        idxs_faixa = [i for i in veiculos if df_valid.at[i, "_FAIXA_KEY"] == fk]
-        for idx in idxs_faixa:
-            # Escolher técnico com menor carga atual
-            min_carga = min(carga.values())
-            candidatos = [tec for tec, c in carga.items() if c == min_carga]
-            escolhido = random.choice(candidatos)
-            assigned[idx] = escolhido
-            carga[escolhido] += 1
+    # 🔹 Balanceamento final para diferença máxima de 1
+    assigned = balancear_globais(assigned, num_tecnicos)
 
-    # Atribuir de volta ao df original
-    df["Técnico"] = None
-    for idx, tec in assigned.items():
-        df.at[idx, "Técnico"] = tec
+    df["TECNICO"] = df.index.map(lambda i: nomes_tecnicos[assigned[i]] if i in assigned else "")
 
-    # Salvar resultado
-    output_path = "/mnt/data/distribuicao_final.xlsx"
-    df.to_excel(output_path, index=False)
-    st.success("Distribuição concluída!")
-    st.download_button("Baixar arquivo distribuído", data=open(output_path, "rb"), file_name="distribuicao_final.xlsx")
+    carga = [0] * num_tecnicos
+    for tech in assigned.values():
+        carga[tech] += 1
 
+    df_saida = df.sort_values("_orig_index").drop(columns=["_orig_index", "_FAIXA_KEY"])
+
+    st.success("Distribuição concluída.")
+    st.write("Carga por técnico (somente veículos atribuídos):")
+    carga_df = pd.DataFrame({"Técnico": nomes_tecnicos, "Qtd": carga})
+    st.table(carga_df)
+
+    st.write("Amostra da planilha resultante:")
+    st.dataframe(df_saida.head(200))
+
+    output_buffer = io.BytesIO()
+    with pd.ExcelWriter(output_buffer, engine="openpyxl") as writer:
+        df_saida.to_excel(writer, index=False)
+    output_buffer.seek(0)
+
+    st.download_button(
+        "📥 Baixar planilha (Excel)",
+        data=output_buffer,
+        file_name="distribuicao_tecnicos.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
