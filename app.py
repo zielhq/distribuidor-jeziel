@@ -61,39 +61,6 @@ def distribuir_faixa_contigua(indices, num_tecnicos):
 
     return mapping
 
-def balancear_globais(assigned, num_tecnicos):
-    """Ajusta assigned para que diferença máxima entre técnicos seja 1."""
-    # Conta veículos por técnico
-    carga = {t: 0 for t in range(num_tecnicos)}
-    for t in assigned.values():
-        carga[t] += 1
-
-    max_carga = max(carga.values())
-    min_carga = min(carga.values())
-
-    # Enquanto diferença > 1, mover 1 veículo do mais carregado para o menos carregado
-    while max_carga - min_carga > 1:
-        tech_max = max(carga, key=carga.get)
-        tech_min = min(carga, key=carga.get)
-
-        # Escolher um índice do tech_max para mover
-        idx_para_mover = None
-        for idx, t in assigned.items():
-            if t == tech_max:
-                idx_para_mover = idx
-                break
-
-        if idx_para_mover is None:
-            break
-
-        assigned[idx_para_mover] = tech_min
-        carga[tech_max] -= 1
-        carga[tech_min] += 1
-
-        max_carga = max(carga.values())
-        min_carga = min(carga.values())
-
-    return assigned
 
 # -----------------------
 # UI
@@ -149,7 +116,8 @@ if uploaded and process_btn:
         mapping = distribuir_faixa_contigua(idxs, num_tecnicos)
         assigned.update(mapping)
 
-    assigned = balancear_globais(assigned, num_tecnicos)
+    # A função de balanceamento global foi removida para manter a proximidade
+    # física dos carros, como no exemplo da FORMA-CERTA.
 
     df["TECNICO"] = df.index.map(lambda i: nomes_tecnicos[assigned[i]] if i in assigned else "")
 
